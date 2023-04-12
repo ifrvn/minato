@@ -29,7 +29,7 @@ export class Builder {
   protected queryOperators: QueryOperators
   protected evalOperators: EvalOperators
 
-  constructor(public tables: Dict<Model>) {
+  constructor(public tables?: Dict<Model>) {
     this.queryOperators = {
       // logical
       $or: (key, value) => this.logicalOr(value.map(value => this.parseFieldQuery(key, value))),
@@ -115,7 +115,7 @@ export class Builder {
   }
 
   protected createNullQuery(key: string, value: boolean) {
-    return `${key} is ${value ? 'not ' : ''} null`
+    return `${key} is ${value ? 'not ' : ''}null`
   }
 
   protected createMemberQuery(key: string, value: any[], notStr = '') {
@@ -219,17 +219,24 @@ export class Builder {
     return this.parseEvalExpr(expr)
   }
 
+  private transformKey(key: string, fields: {}, prefix: string) {
+    if (key in fields || !key.includes('.')) return prefix + escapeId(key)
+    const field = Object.keys(fields).find(k => key.startsWith(k + '.')) || key.split('.')[0]
+    const rest = key.slice(field.length + 1).split('.')
+    return `json_unquote(json_extract(${escapeId(prefix + field)}, '$${rest.map(key => `."${key}"`).join('')}'))`
+  }
+
   private getRecursive(args: string | string[]) {
     if (typeof args === 'string') {
       return this.getRecursive(['_', args])
-    } else {
-      const [table, key] = args
-      const fields = this.tables[table]?.fields || {}
-      if (key in fields || !key.includes('.')) return escapeId(key)
-      const field = Object.keys(fields).find(k => key.startsWith(k + '.')) || key.split('.')[0]
-      const rest = key.slice(field.length + 1).split('.')
-      return `json_unquote(json_extract(${escapeId(field)}, '$${rest.map(key => `."${key}"`).join('')}'))`
     }
+    const [table, key] = args
+    const fields = this.tables?.[table]?.fields || {}
+    if (fields[key]?.expr) {
+      return this.parseEvalExpr(fields[key]?.expr)
+    }
+    const prefix = !this.tables || table === '_' || key in fields ? '' : `${escapeId(table)}.`
+    return this.transformKey(key, fields, prefix) 
   }
 
   parseEval(expr: any): string {
@@ -257,30 +264,51 @@ export class Builder {
     return sql
   }
 
-  get(sel: Selection.Immutable) {
-    const { args, table, query, ref } = sel
+  get(sel: Selection.Immutable, inline = false) {
+    const { args, table, query, ref, model } = sel
     const filter = this.parseQuery(query)
     if (filter === '0') return
-    const { fields } = args[0]
-    const keys = !fields ? '*' : Object.entries(fields).map(([key, value]) => {
+
+    // get prefix
+    const fields = args[0].fields ?? Object.fromEntries(Object
+      .entries(model.fields)
+      .filter(([, field]) => !field!.deprecated)
+      .map(([key]) => [key, { $: [ref, key] }]))
+    const keys = Object.entries(fields).map(([key, value]) => {
       key = escapeId(key)
       value = this.parseEval(value)
       return key === value ? key : `${value} AS ${key}`
     }).join(', ')
-    let prefix = `SELECT ${keys} FROM `
+    let prefix: string | undefined
+    if (typeof table === 'string') {
+      prefix = escapeId(table)
+    } else if (table instanceof Selection) {
+      prefix = this.get(table, true)
+      if (!prefix) return
+    } else {
+      prefix = Object.entries(table).map(([key, table]) => {
+        if (typeof table !== 'string') {
+          return `${this.get(table, true)} AS ${escapeId(key)}`
+        } else {
+          return key === table ? escapeId(table) : `${escapeId(table)} AS ${escapeId(key)}`
+        }
+      }).join(' JOIN ')
+      const filter = this.parseEval(args[0].having)
+      if (filter !== '1') prefix += ` ON ${filter}`
+    }
+
+    // get suffix
     let suffix = this.suffix(args[0])
     if (filter !== '1') {
       suffix = ` WHERE ${filter}` + suffix
     }
-    if (typeof table === 'string') {
-      prefix += escapeId(table)
-    } else {
-      const inner = this.get(table)
-      if (!inner) return
-      if (!fields && !suffix) return inner
-      prefix += `(${inner})`
+    if (!prefix.includes(' ') || prefix.startsWith('(')) {
+      suffix = ` ${ref}` + suffix
     }
-    return `${prefix} ${ref}${suffix}`
+
+    if (inline && !args[0].fields && !suffix) return prefix
+    const result = `SELECT ${keys} FROM ${prefix}${suffix}`
+    return inline ? `(${result})` : result
   }
 
   define<S, T>(converter: Transformer<S, T>) {

@@ -1,13 +1,13 @@
 import { BSONType, Collection, Db, IndexDescription, MongoClient, MongoError } from 'mongodb'
-import { Dict, makeArray, noop, omit, pick } from 'cosmokit'
-import { Database, Driver, Eval, executeEval, executeUpdate, Query, RuntimeError, Selection } from '@minatojs/core'
+import { Dict, isNullable, makeArray, noop, omit, pick } from 'cosmokit'
+import { Database, Driver, Eval, executeEval, executeUpdate, Model, Query, RuntimeError, Selection } from '@minatojs/core'
 import { URLSearchParams } from 'url'
 import { Transformer } from './utils'
 import Logger from 'reggol'
 
 const logger = new Logger('mongo')
 
-namespace MongoDriver {
+export namespace MongoDriver {
   export interface Config {
     username?: string
     password?: string
@@ -40,7 +40,7 @@ interface EvalTask extends Result {
   reject: (reason: unknown) => void
 }
 
-class MongoDriver extends Driver {
+export class MongoDriver extends Driver {
   public client!: MongoClient
   public db!: Db
   public mongo = this
@@ -88,7 +88,7 @@ class MongoDriver extends Driver {
    * https://www.mongodb.com/docs/manual/indexes/
    */
   private async _createIndexes(table: string) {
-    const { fields, primary, unique } = this.model(table)
+    const { primary, unique } = this.model(table)
     const coll = this.db.collection(table)
     const newSpecs: IndexDescription[] = []
     const oldSpecs = await coll.indexes()
@@ -125,7 +125,8 @@ class MongoDriver extends Driver {
     const coll = this.db.collection(table)
     const bulk = coll.initializeOrderedBulkOp()
     for (const key in fields) {
-      const { initial, legacy = [] } = fields[key]!
+      const { initial, legacy = [], deprecated } = fields[key]!
+      if (deprecated) continue
       const filter = { [key]: { $exists: false } }
       for (const oldKey of legacy) {
         bulk
@@ -133,7 +134,7 @@ class MongoDriver extends Driver {
           .update({ $rename: { [oldKey]: key } })
         filter[oldKey] = { $exists: false }
       }
-      bulk.find(filter).update({ $set: { [key]: initial } })
+      bulk.find(filter).update({ $set: { [key]: initial ?? null } })
       if (legacy.length) {
         const $unset = Object.fromEntries(legacy.map(key => [key, '']))
         bulk.find({}).update({ $unset })
@@ -174,13 +175,26 @@ class MongoDriver extends Driver {
   async prepare(table: string) {
     await Promise.all([
       this._createInternalTable(),
-      this.db.createCollection(table).catch(noop)
+      this.db.createCollection(table).catch(noop),
     ])
+
     await Promise.all([
       this._createIndexes(table),
       this._createFields(table),
       this._migratePrimary(table),
     ])
+
+    const $unset = {}
+    this.migrate(table, {
+      error: logger.warn,
+      before: () => true,
+      after: keys => keys.forEach(key => $unset[key] = ''),
+      finalize: async () => {
+        if (!Object.keys($unset).length) return
+        const coll = this.db.collection(table)
+        await coll.updateMany({}, { $unset })
+      },
+    })
   }
 
   async drop(table?: string) {
@@ -246,7 +260,11 @@ class MongoDriver extends Driver {
     return new Transformer(this.getVirtualKey(table)).query(query)
   }
 
-  private createPipeline(sel: Selection.Immutable) {
+  private createPipeline(sel: string | Selection.Immutable) {
+    if (typeof sel === 'string') {
+      sel = this.database.select(sel)
+    }
+
     const { table, query } = sel
     const pipeline: any[] = []
     const result = { pipeline } as Result
@@ -254,11 +272,38 @@ class MongoDriver extends Driver {
     if (typeof table === 'string') {
       result.table = table
       transformer.virtualKey = this.getVirtualKey(table)
-    } else {
+    } else if (table instanceof Selection) {
       const predecessor = this.createPipeline(table)
       if (!predecessor) return
       result.table = predecessor.table
-      pipeline.unshift(...predecessor.pipeline)
+      pipeline.push(...predecessor.pipeline)
+    } else {
+      for (const [name, subtable] of Object.entries(table)) {
+        const predecessor = this.createPipeline(subtable)
+        if (!predecessor) return
+        if (!result.table) {
+          result.table = predecessor.table
+          pipeline.push(...predecessor.pipeline, {
+            $replaceRoot: { newRoot: { [name]: '$$ROOT' } },
+          })
+          continue
+        }
+        const $lookup = {
+          from: predecessor.table,
+          as: name,
+          pipeline: predecessor.pipeline,
+        }
+        const $unwind = {
+          path: `$${name}`,
+        }
+        pipeline.push({ $lookup }, { $unwind })
+        if (sel.args[0].having['$and'].length) {
+          transformer.lookup = true
+          const $expr = transformer.eval(sel.args[0].having)
+          pipeline.push({ $match: { $expr } })
+          transformer.lookup = false
+        }
+      }
     }
 
     // where
@@ -364,24 +409,30 @@ class MongoDriver extends Driver {
     await this.db.collection(table).deleteMany(filter)
   }
 
+  private async ensurePrimary(table: string, data: any[]) {
+    const model = this.model(table)
+    const { primary, autoInc } = model
+    if (typeof primary === 'string' && autoInc) {
+      const missing = data.filter(item => !(primary in item))
+      if (!missing.length) return
+      const { value } = await this.db.collection('_fields').findOneAndUpdate(
+        { table, field: primary },
+        { $inc: { autoInc: missing.length } },
+        { upsert: true },
+      )
+      for (let i = 1; i <= missing.length; i++) {
+        missing[i - 1][primary] = value!.autoInc + i
+      }
+    }
+  }
+
   async create(sel: Selection.Mutable, data: any) {
     const { table } = sel
     const lastTask = Promise.resolve(this._createTasks[table]).catch(noop)
     return this._createTasks[table] = lastTask.then(async () => {
       const model = this.model(table)
       const coll = this.db.collection(table)
-      const { primary, autoInc } = model
-
-      if (typeof primary === 'string' && !(primary in data)) {
-        if (autoInc) {
-          const { value } = await this.db.collection('_fields').findOneAndUpdate(
-            { table, field: primary },
-            { $inc: { autoInc: 1 } },
-            { upsert: true, returnDocument: 'after' },
-          )
-          data[primary] = value!.autoInc
-        }
-      }
+      await this.ensurePrimary(table, [data])
 
       try {
         data = model.create(data)
@@ -408,8 +459,9 @@ class MongoDriver extends Driver {
     }).toArray()).map(row => this.patchVirtual(table, row))
 
     const bulk = coll.initializeUnorderedBulkOp()
+    const insertion: any[] = []
     for (const update of data) {
-      const item = original.find(item => keys.every(key => item[key].valueOf() === update[key].valueOf()))
+      const item = original.find(item => keys.every(key => item[key]?.valueOf() === update[key]?.valueOf()))
       if (item) {
         const updateFields = new Set(Object.keys(update).map(key => key.split('.', 1)[0]))
         const override = omit(pick(executeUpdate(item, update, ref), updateFields), keys)
@@ -417,9 +469,13 @@ class MongoDriver extends Driver {
         if (!query) continue
         bulk.find(query).updateOne({ $set: override })
       } else {
-        const copy = executeUpdate(model.create(), update, ref)
-        bulk.insert(this.unpatchVirtual(table, copy))
+        insertion.push(update)
       }
+    }
+    await this.ensurePrimary(table, insertion)
+    for (const update of insertion) {
+      const copy = executeUpdate(model.create(), update, ref)
+      bulk.insert(this.unpatchVirtual(table, copy))
     }
     await bulk.execute()
   }

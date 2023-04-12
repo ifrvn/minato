@@ -242,6 +242,20 @@ namespace SelectionTests {
       ])
     })
   }
+
+  export function join(database: Database<Tables>) {
+    it('inner join', async () => {
+      await expect(database
+        .join(['foo', 'bar'] as const)
+        .execute()
+      ).to.eventually.have.length(18)
+
+      await expect(database
+        .join(['foo', 'bar'] as const, (foo, bar) => $.eq(foo.value, bar.value))
+        .execute()
+      ).to.eventually.have.length(2)
+    })
+  }
 }
 
 export default SelectionTests

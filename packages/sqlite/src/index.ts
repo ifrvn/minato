@@ -35,7 +35,7 @@ export interface SQLiteFieldInfo {
   pk: boolean
 }
 
-namespace SQLiteDriver {
+export namespace SQLiteDriver {
   export interface Config {
     path: string
   }
@@ -46,7 +46,7 @@ class SQLiteBuilder extends Builder {
     "'": "''",
   }
 
-  constructor(tables: Dict<Model>) {
+  constructor(tables?: Dict<Model>) {
     super(tables)
 
     this.evalOperators.$if = (args) => `iif(${args.map(arg => this.parseEval(arg)).join(', ')})`
@@ -71,7 +71,7 @@ class SQLiteBuilder extends Builder {
 
     this.define<Date, number>({
       types: ['date', 'time', 'timestamp'],
-      dump: value => value === null ? null : +value,
+      dump: value => value === null ? null : +new Date(value),
       load: (value) => value === null ? null : new Date(value),
     })
   }
@@ -86,7 +86,7 @@ class SQLiteBuilder extends Builder {
   }
 }
 
-class SQLiteDriver extends Driver {
+export class SQLiteDriver extends Driver {
   db!: init.Database
   sql: Builder
   writeTask?: NodeJS.Timeout
@@ -95,12 +95,12 @@ class SQLiteDriver extends Driver {
   constructor(database: Database, public config: SQLiteDriver.Config) {
     super(database)
 
-    this.sql = new SQLiteBuilder(database.tables)
+    this.sql = new SQLiteBuilder()
   }
 
   /** synchronize table schema */
-  async prepare(table: string) {
-    const info = this.#all(`PRAGMA table_info(${escapeId(table)})`) as SQLiteFieldInfo[]
+  async prepare(table: string, dropKeys?: string[]) {
+    const columns = this.#all(`PRAGMA table_info(${escapeId(table)})`) as SQLiteFieldInfo[]
     const model = this.model(table)
     const columnDefs: string[] = []
     const indexDefs: string[] = []
@@ -110,8 +110,13 @@ class SQLiteDriver extends Driver {
 
     // field definitions
     for (const key in model.fields) {
+      if (model.fields[key]!.deprecated) {
+        if (dropKeys?.includes(key)) shouldMigrate = true
+        continue
+      }
+
       const legacy = [key, ...model.fields[key]!.legacy || []]
-      const column = info.find(({ name }) => legacy.includes(name))
+      const column = columns.find(({ name }) => legacy.includes(name))
       const { initial, nullable = true } = model.fields[key]!
       const typedef = getTypeDef(model.fields[key]!)
       let def = `${escapeId(key)} ${typedef}`
@@ -146,39 +151,51 @@ class SQLiteDriver extends Driver {
       }))
     }
 
-    if (!info.length) {
+    if (!columns.length) {
       logger.info('auto creating table %c', table)
       this.#run(`CREATE TABLE ${escapeId(table)} (${[...columnDefs, ...indexDefs].join(', ')})`)
     } else if (shouldMigrate) {
       // preserve old columns
-      for (const column of info) {
-        if (mapping[column.name]) continue
-        let def = `${escapeId(column.name)} ${column.type}`
-        def += (column.notnull ? ' NOT ' : ' ') + 'NULL'
-        if (column.pk) def += ' PRIMARY KEY'
-        if (column.dflt_value !== null) def += ' DEFAULT ' + this.sql.escape(column.dflt_value)
+      for (const { name, type, notnull, pk, dflt_value } of columns) {
+        if (mapping[name] || dropKeys?.includes(name)) continue
+        let def = `${escapeId(name)} ${type}`
+        def += (notnull ? ' NOT ' : ' ') + 'NULL'
+        if (pk) def += ' PRIMARY KEY'
+        if (dflt_value !== null) def += ' DEFAULT ' + this.sql.escape(dflt_value)
         columnDefs.push(def)
-        mapping[column.name] = column.name
+        mapping[name] = name
       }
 
       const temp = table + '_temp'
       const fields = Object.keys(mapping).map(escapeId).join(', ')
       logger.info('auto migrating table %c', table)
-      this.#run(`CREATE TABLE ${escapeId(temp)} (${columnDefs.join(', ')})`)
+      this.#run(`CREATE TABLE ${escapeId(temp)} (${[...columnDefs, ...indexDefs].join(', ')})`)
       try {
         this.#run(`INSERT INTO ${escapeId(temp)} SELECT ${fields} FROM ${escapeId(table)}`)
         this.#run(`DROP TABLE ${escapeId(table)}`)
-        this.#run(`CREATE TABLE ${escapeId(table)} (${[...columnDefs, ...indexDefs].join(', ')})`)
-        this.#run(`INSERT INTO ${escapeId(table)} SELECT * FROM ${escapeId(temp)}`)
-      } finally {
+      } catch (error) {
         this.#run(`DROP TABLE ${escapeId(temp)}`)
+        throw error
       }
+      this.#run(`ALTER TABLE ${escapeId(temp)} RENAME TO ${escapeId(table)}`)
     } else if (alter.length) {
       logger.info('auto updating table %c', table)
       for (const def of alter) {
         this.#run(`ALTER TABLE ${escapeId(table)} ${def}`)
       }
     }
+
+    if (dropKeys) return
+    dropKeys = []
+    this.migrate(table, {
+      error: logger.warn,
+      before: keys => keys.every(key => columns.some(({ name }) => name === key)),
+      after: keys => dropKeys!.push(...keys),
+      finalize: () => {
+        if (!dropKeys!.length) return
+        this.prepare(table, dropKeys)
+      },
+    })
   }
 
   init(buffer: ArrayLike<number> | null) {
@@ -186,10 +203,21 @@ class SQLiteDriver extends Driver {
     this.db.create_function('regexp', (pattern, str) => +new RegExp(pattern).test(str))
   }
 
+  async load() {
+    if (this.config.path === ':memory:') return null
+    return fs.readFile(this.config.path).catch(() => null)
+  }
+
   async start() {
     const [sqlite, buffer] = await Promise.all([
-      init(),
-      this.config.path === ':memory:' ? null : fs.readFile(this.config.path).catch<Buffer | null>(() => null),
+      init({
+        locateFile: (file: string) => process.env.KOISHI_BASE
+          ? process.env.KOISHI_BASE + '/' + file
+          : process.env.KOISHI_ENV === 'browser'
+            ? '/' + file
+            : require.resolve('@minatojs/sql.js/dist/' + file),
+      }),
+      this.load(),
     ])
     this.sqlite = sqlite
     this.init(buffer)
@@ -267,24 +295,19 @@ class SQLiteDriver extends Driver {
   }
 
   async get(sel: Selection.Immutable) {
-    const { tables } = sel
+    const { model, tables } = sel
     const builder = new SQLiteBuilder(tables)
     const sql = builder.get(sel)
     if (!sql) return []
     const rows = this.#all(sql)
-    return rows.map(row => this.sql.load(sel.model, row))
+    return rows.map(row => builder.load(model, row))
   }
 
   async eval(sel: Selection.Immutable, expr: Eval.Expr) {
-    const output = this.sql.parseEval(expr)
-    let sql = this.sql.get(sel.table as Selection)
-    const prefix = `SELECT ${output} AS value `
-    if (sql.startsWith('SELECT * ')) {
-      sql = prefix + sql.slice(9)
-    } else {
-      sql = `${prefix}FROM (${sql}) ${sql.ref}`
-    }
-    const { value } = this.#get(sql)
+    const builder = new SQLiteBuilder(sel.tables)
+    const output = builder.parseEval(expr)
+    const inner = builder.get(sel.table as Selection, true)
+    const { value } = this.#get(`SELECT ${output} AS value FROM ${inner} ${sel.ref}`)
     return value
   }
 

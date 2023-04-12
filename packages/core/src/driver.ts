@@ -1,8 +1,8 @@
-import { Dict, makeArray, MaybeArray, valueMap } from 'cosmokit'
+import { Awaitable, Dict, Intersect, makeArray, MaybeArray, valueMap } from 'cosmokit'
 import { Eval, Update } from './eval'
 import { Field, Model } from './model'
 import { Query } from './query'
-import { Flatten, Indexable, Keys } from './utils'
+import { Flatten, Indexable, Keys, Row } from './utils'
 import { Direction, Modifier, Selection } from './selection'
 
 export namespace Driver {
@@ -26,35 +26,70 @@ export namespace Driver {
   }
 }
 
+type TableLike<S> = Keys<S> | Selection
+
+type TableType<S, T extends TableLike<S>> =
+  | T extends Keys<S> ? S[T]
+  : T extends Selection<infer U> ? U
+  : never
+
+type TableMap1<S, M extends readonly Keys<S>[]> = Intersect<
+  | M extends readonly (infer K extends Keys<S>)[]
+  ? { [P in K]: TableType<S, P> }
+  : never
+>
+
+type TableMap2<S, U extends Dict<TableLike<S>>> = {
+  [K in keyof U]: TableType<S, U[K]>
+}
+
+type JoinParameters<S, U extends readonly Keys<S>[]> =
+  | U extends readonly [infer K extends Keys<S>, ...infer R]
+  ? [Row<S[K]>, ...JoinParameters<S, Extract<R, readonly Keys<S>[]>>]
+  : []
+
+type JoinCallback1<S, U extends readonly Keys<S>[]> = (...args: JoinParameters<S, U>) => Eval.Expr<boolean>
+
+type JoinCallback2<S, U extends Dict<TableLike<S>>> = (args: {
+  [K in keyof U]: Row<TableType<S, U[K]>>
+}) => Eval.Expr<boolean>
+
 export class Database<S = any> {
   public tables: { [K in Keys<S>]: Model<S[K]> } = Object.create(null)
   public drivers: Record<keyof any, Driver> = Object.create(null)
-  private tasks: Dict<Promise<void>> = Object.create(null)
+  public migrating = false
+  private prepareTasks: Dict<Promise<void>> = Object.create(null)
+  private migrateTasks: Dict<Promise<void>> = Object.create(null)
+
   private stashed = new Set<string>()
 
   refresh() {
     for (const name in this.tables) {
-      this.tasks[name] = this.prepare(name)
+      this.prepareTasks[name] = this.prepare(name)
     }
   }
 
-  private getDriver(name: string) {
+  async prepared() {
+    await Promise.all(Object.values(this.prepareTasks))
+    if (!this.migrating) {
+      await Promise.all(Object.values(this.migrateTasks))
+    }
+  }
+
+  private getDriver(table: any) {
     // const model: Model = this.tables[name]
     // if (model.driver) return this.drivers[model.driver]
-    return Object.values(this.drivers)[0]
+    const driver = Object.values(this.drivers)[0]
+    if (driver) driver.database = this
+    return driver
   }
 
   private async prepare(name: string) {
     this.stashed.add(name)
-    await this.tasks[name]
-    return new Promise<void>(async (resolve) => {
-      Promise.resolve().then(async () => {
-        if (this.stashed.delete(name)) {
-          await this.getDriver(name)?.prepare(name)
-        }
-        resolve()
-      })
-    })
+    await this.prepareTasks[name]
+    await Promise.resolve()
+    if (!this.stashed.delete(name)) return
+    await this.getDriver(name)?.prepare(name)
   }
 
   extend<K extends Keys<S>>(name: K, fields: Field.Extension<S[K]>, config: Partial<Model.Config<S[K]>> = {}) {
@@ -64,40 +99,46 @@ export class Database<S = any> {
       // model.driver = config.driver
     }
     model.extend(fields, config)
-    this.tasks[name] = this.prepare(name)
+    this.prepareTasks[name] = this.prepare(name)
   }
 
-  select<T extends Selection.Selector<S>>(table: T, query?: Query<Selection.Resolve<S, T>>): Selection<Selection.Resolve<S, T>> {
+  migrate<K extends Keys<S>>(name: K, fields: Field.Extension<S[K]>, callback: Model.Migration) {
+    this.extend(name, fields, { callback })
+  }
+
+  select<T extends Keys<S>>(table: T, query?: Query<S[T]>): Selection<S[T]> {
     return new Selection(this.getDriver(table), table, query)
   }
 
-  async get<T extends Keys<S>, K extends Keys<S[T]>>(table: T, query: Query<Selection.Resolve<S, T>>, cursor?: Driver.Cursor<K>): Promise<Pick<S[T], K>[]> {
-    await this.tasks[table]
-    if (Array.isArray(cursor)) {
-      cursor = { fields: cursor }
-    } else if (!cursor) {
-      cursor = {}
-    }
-
-    const selection = this.select(table, query)
-    if (cursor.fields) selection.project(cursor.fields)
-    if (cursor.limit !== undefined) selection.limit(cursor.limit)
-    if (cursor.offset !== undefined) selection.offset(cursor.offset)
-    if (cursor.sort) {
-      for (const field in cursor.sort) {
-        selection.orderBy(field as any, cursor.sort[field])
+  join<U extends readonly Keys<S>[]>(tables: U, callback?: JoinCallback1<S, U>, optional?: boolean[]): Selection<TableMap1<S, U>>
+  join<U extends Dict<TableLike<S>>>(tables: U, callback?: JoinCallback2<S, U>, optional?: Dict<boolean, Keys<U>>): Selection<TableMap2<S, U>>
+  join(tables: any, query?: any, optional?: any) {
+    if (Array.isArray(tables)) {
+      const sel = new Selection(this.getDriver(tables[0]), Object.fromEntries(tables.map((name) => [name, name])))
+      if (typeof query === 'function') {
+        sel.args[0].having = Eval.and(query(...tables.map(name => sel.row[name])))
       }
+      sel.args[0].optional = Object.fromEntries(tables.map((name, index) => [name, optional?.[index]]))
+      return sel
+    } else {
+      const sel = new Selection(this.getDriver(tables[0]), tables)
+      if (typeof query === 'function') {
+        sel.args[0].having = Eval.and(query(sel.row))
+      }
+      sel.args[0].optional = optional
+      return sel
     }
-    return selection.execute()
   }
 
-  async eval<K extends Keys<S>, T>(table: K, expr: Selection.Callback<S[K], T>, query?: Query<Selection.Resolve<S, K>>): Promise<T> {
-    await this.tasks[table]
+  async get<T extends Keys<S>, K extends Keys<S[T]>>(table: T, query: Query<S[T]>, cursor?: Driver.Cursor<K>): Promise<Pick<S[T], K>[]> {
+    return this.select(table, query).execute(cursor)
+  }
+
+  async eval<T extends Keys<S>, U>(table: T, expr: Selection.Callback<S[T], U>, query?: Query<S[T]>): Promise<U> {
     return this.select(table, query).execute(typeof expr === 'function' ? expr : () => expr)
   }
 
-  async set<T extends Keys<S>>(table: T, query: Query<Selection.Resolve<S, T>>, update: Selection.Yield<S[T], Update<S[T]>>) {
-    await this.tasks[table]
+  async set<T extends Keys<S>>(table: T, query: Query<S[T]>, update: Row.Computed<S[T], Update<S[T]>>) {
     const sel = this.select(table, query)
     if (typeof update === 'function') update = update(sel.row)
     const primary = makeArray(sel.model.primary)
@@ -107,20 +148,17 @@ export class Database<S = any> {
     await sel._action('set', sel.model.format(update)).execute()
   }
 
-  async remove<T extends Keys<S>>(table: T, query: Query<Selection.Resolve<S, T>>) {
-    await this.tasks[table]
+  async remove<T extends Keys<S>>(table: T, query: Query<S[T]>) {
     const sel = this.select(table, query)
     await sel._action('remove').execute()
   }
 
   async create<T extends Keys<S>>(table: T, data: Partial<S[T]>): Promise<S[T]> {
-    await this.tasks[table]
     const sel = this.select(table)
     return sel._action('create', sel.model.create(data)).execute()
   }
 
-  async upsert<T extends Keys<S>>(table: T, upsert: Selection.Yield<S[T], Update<S[T]>[]>, keys?: MaybeArray<Keys<Flatten<S[T]>, Indexable>>) {
-    await this.tasks[table]
+  async upsert<T extends Keys<S>>(table: T, upsert: Row.Computed<S[T], Update<S[T]>[]>, keys?: MaybeArray<Keys<Flatten<S[T]>, Indexable>>) {
     const sel = this.select(table)
     if (typeof upsert === 'function') upsert = upsert(sel.row)
     upsert = upsert.map(item => sel.model.format(item))
@@ -172,18 +210,57 @@ export abstract class Driver {
 
   constructor(public database: Database) {}
 
-  model<S = any>(table: string | Selection<S>): Model<S> {
+  model<S = any>(table: string | Selection.Immutable | Dict<string | Selection.Immutable>): Model<S> {
     if (typeof table === 'string') {
       const model = this.database.tables[table]
       if (model) return model
       throw new TypeError(`unknown table name "${table}"`)
     }
 
-    if (!table.args[0].fields) return table.model
+    if (table instanceof Selection) {
+      if (!table.args[0].fields) return table.model
+      const model = new Model('temp')
+      model.fields = valueMap(table.args[0].fields, (_, key) => ({
+        type: 'expr',
+      }))
+      return model
+    }
+
     const model = new Model('temp')
-    model.fields = valueMap(table.args[0].fields, () => ({
-      type: 'expr',
-    }))
+    for (const key in table) {
+      const submodel = this.model(table[key])
+      for (const field in submodel.fields) {
+        model.fields[`${key}.${field}`] = {
+          type: 'expr',
+          expr: { $: [key, field] } as any,
+        }
+      }
+    }
     return model
   }
+
+  async migrate(name: string, hooks: MigrationHooks) {
+    const database = Object.create(this.database)
+    const model = this.model(name)
+    database.migrating = true
+    if (this.database.migrating) await database.migrateTasks[name]
+    database.migrateTasks[name] = Promise.resolve(database.migrateTasks[name]).then(() => {
+      return Promise.all([...model.migrations].map(async ([migrate, keys]) => {
+        try {
+          if (!hooks.before(keys)) return
+          await migrate(database)
+          hooks.after(keys)
+        } catch (reason) {
+          hooks.error(reason)
+        }
+      }))
+    }).then(hooks.finalize).catch(hooks.error)
+  }
+}
+
+export interface MigrationHooks {
+  before: (keys: string[]) => boolean
+  after: (keys: string[]) => void
+  finalize: () => Awaitable<void>
+  error: (reason: any) => void
 }

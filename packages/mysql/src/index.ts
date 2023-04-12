@@ -88,20 +88,21 @@ interface QueryTask {
 }
 
 class MySQLBuilder extends Builder {
+  // eslint-disable-next-line no-control-regex
   protected escapeRegExp = /[\0\b\t\n\r\x1a'"\\]/g
   protected escapeMap = {
-    '\0' : '\\0',
-    '\b' : '\\b',
-    '\t' : '\\t',
-    '\n' : '\\n',
-    '\r' : '\\r',
-    '\x1a' : '\\Z',
-    '\"' : '\\\"',
-    '\'' : '\\\'',
-    '\\' : '\\\\',
+    '\0': '\\0',
+    '\b': '\\b',
+    '\t': '\\t',
+    '\n': '\\n',
+    '\r': '\\r',
+    '\x1a': '\\Z',
+    '\"': '\\\"',
+    '\'': '\\\'',
+    '\\': '\\\\',
   }
 
-  constructor(tables: Dict<Model>) {
+  constructor(tables?: Dict<Model>) {
     super(tables)
 
     this.define<string[], string>({
@@ -119,11 +120,11 @@ class MySQLBuilder extends Builder {
   }
 }
 
-namespace MySQLDriver {
+export namespace MySQLDriver {
   export interface Config extends PoolConfig {}
 }
 
-class MySQLDriver extends Driver {
+export class MySQLDriver extends Driver {
   public pool!: Pool
   public config: MySQLDriver.Config
   public sql: MySQLBuilder
@@ -167,7 +168,7 @@ class MySQLDriver extends Driver {
       ...config,
     }
 
-    this.sql = new MySQLBuilder(database.tables)
+    this.sql = new MySQLBuilder()
   }
 
   async start() {
@@ -202,7 +203,8 @@ class MySQLDriver extends Driver {
 
     // field definitions
     for (const key in fields) {
-      const { initial, nullable = true } = fields[key]!
+      const { deprecated, initial, nullable = true } = fields[key]!
+      if (deprecated) continue
       const legacy = [key, ...fields[key]!.legacy || []]
       const column = columns.find(info => legacy.includes(info.COLUMN_NAME))
       let shouldUpdate = column?.COLUMN_NAME !== key
@@ -263,7 +265,7 @@ class MySQLDriver extends Driver {
 
     if (!columns.length) {
       logger.info('auto creating table %c', name)
-      return this.queue(`CREATE TABLE ?? (${create.join(', ')}) COLLATE = ?`, [name, this.config.charset])
+      return this.query(`CREATE TABLE ${escapeId(name)} (${create.join(', ')}) COLLATE = ${this.sql.escape(this.config.charset)}`)
     }
 
     const operations = [
@@ -273,8 +275,21 @@ class MySQLDriver extends Driver {
     if (operations.length) {
       // https://dev.mysql.com/doc/refman/5.7/en/alter-table.html
       logger.info('auto updating table %c', name)
-      await this.queue(`ALTER TABLE ?? ${operations.join(', ')}`, [name])
+      await this.query(`ALTER TABLE ${escapeId(name)} ${operations.join(', ')}`)
     }
+
+    // migrate deprecated fields (do not await)
+    const dropKeys: string[] = []
+    this.migrate(name, {
+      error: logger.warn,
+      before: keys => keys.every(key => columns.some(info => info.COLUMN_NAME === key)),
+      after: keys => dropKeys.push(...keys),
+      finalize: async () => {
+        if (!dropKeys.length) return
+        logger.info('auto migrating table %c', name)
+        await this.query(`ALTER TABLE ${escapeId(name)} ${dropKeys.map(key => `DROP ${escapeId(key)}`).join(', ')}`)
+      },
+    })
   }
 
   _joinKeys = (keys: readonly string[]) => {
@@ -362,20 +377,15 @@ class MySQLDriver extends Driver {
     const sql = builder.get(sel)
     if (!sql) return []
     return this.queue(sql).then((data) => {
-      return data.map((row) => this.sql.load(model, row))
+      return data.map((row) => builder.load(model, row))
     })
   }
 
   async eval(sel: Selection.Immutable, expr: Eval.Expr) {
-    const output = this.sql.parseEval(expr)
-    let sql = this.sql.get(sel.table as Selection)
-    const prefix = `SELECT ${output} AS value `
-    if (sql.startsWith('SELECT * ')) {
-      sql = prefix + sql.slice(9)
-    } else {
-      sql = `${prefix}FROM (${sql}) ${sql.ref}`
-    }
-    const [data] = await this.queue(sql)
+    const builder = new MySQLBuilder(sel.tables)
+    const output = builder.parseEval(expr)
+    const inner = builder.get(sel.table as Selection, true)
+    const [data] = await this.queue(`SELECT ${output} AS value FROM ${inner} ${sel.ref}`)
     return data.value
   }
 
@@ -423,7 +433,7 @@ class MySQLDriver extends Driver {
       return `${escaped} = ${this.toUpdateExpr(data, field, fields[field], false)}`
     }).join(', ')
 
-    await this.query(`UPDATE ${table} SET ${update} WHERE ${filter}`)
+    await this.query(`UPDATE ${escapeId(table)} SET ${update} WHERE ${filter}`)
   }
 
   async remove(sel: Selection.Mutable) {
@@ -455,7 +465,7 @@ class MySQLDriver extends Driver {
       Object.assign(merged, item)
       return model.format(executeUpdate(model.create(), item, ref))
     })
-    const initFields = Object.keys(model.fields)
+    const initFields = Object.keys(model.fields).filter(key => !model.fields[key]?.deprecated)
     const dataFields = [...new Set(Object.keys(merged).map((key) => {
       return initFields.find(field => field === key || key.startsWith(field + '.'))!
     }))]

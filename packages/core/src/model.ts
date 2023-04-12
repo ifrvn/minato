@@ -1,5 +1,6 @@
 import { clone, isNullable, makeArray, MaybeArray } from 'cosmokit'
-import { isEvalExpr } from './eval'
+import { Database } from './driver'
+import { Eval, isEvalExpr } from './eval'
 import { Selection } from './selection'
 import { Flatten, Keys } from './utils'
 
@@ -10,8 +11,9 @@ export interface Field<T = any> {
   initial?: T
   precision?: number
   scale?: number
-  expr?: Selection.Callback
+  expr?: Eval.Expr
   legacy?: string[]
+  deprecated?: boolean
 }
 
 export namespace Field {
@@ -76,7 +78,10 @@ export namespace Field {
 }
 
 export namespace Model {
+  export type Migration = (database: Database) => Promise<void>
+
   export interface Config<O = {}> {
+    callback?: Migration
     // driver?: keyof any
     autoInc: boolean
     primary: MaybeArray<Keys<O>>
@@ -91,6 +96,7 @@ export interface Model<S> extends Model.Config<S> {}
 
 export class Model<S = any> {
   fields: Field.Config<S> = {}
+  migrations = new Map<Model.Migration, string[]>()
 
   constructor(public name: string) {
     this.autoInc = false
@@ -101,15 +107,18 @@ export class Model<S = any> {
 
   extend(fields: Field.Extension<S>, config?: Partial<Model.Config<S>>): void
   extend(fields = {}, config: Partial<Model.Config> = {}) {
-    const { primary, autoInc, unique = [] as [], foreign } = config
+    const { primary, autoInc, unique = [] as [], foreign, callback } = config
 
     this.primary = primary || this.primary
     this.autoInc = autoInc || this.autoInc
     this.unique.push(...unique)
     Object.assign(this.foreign, foreign)
 
+    if (callback) this.migrations.set(callback, Object.keys(fields))
+
     for (const key in fields) {
       this.fields[key] = Field.parse(fields[key])
+      this.fields[key].deprecated = !!callback
     }
 
     // check index
@@ -178,7 +187,8 @@ export class Model<S = any> {
     const result = {} as S
     const keys = makeArray(this.primary)
     for (const key in this.fields) {
-      const { initial } = this.fields[key]!
+      const { initial, deprecated } = this.fields[key]!
+      if (deprecated) continue
       if (!keys.includes(key) && !isNullable(initial)) {
         result[key] = clone(initial)
       }
